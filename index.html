@@ -97,7 +97,7 @@
             return <i data-lucide={name} width={size} height={size} className={className}></i>;
         };
 
-        // --- PARSING ENGINE (ROUND TRIP) ---
+        // --- PARSING ENGINE ---
         const parseTradeData = (text, brokerId) => {
             const config = BROKERS[brokerId];
             const map = config.mappings;
@@ -117,13 +117,9 @@
                 type: getIdx(map.type), qty: getIdx(map.qty), price: getIdx(map.price), charges: getIdx(map.charges)
             };
 
-            if (idxs.sec === -1 || idxs.qty === -1 || idxs.price === -1) {
-                throw new Error(`Column mismatch. Are you sure this is a ${config.name} file? Missing columns.`);
-            }
+            if (idxs.sec === -1 || idxs.qty === -1 || idxs.price === -1) throw new Error("Column mismatch. Are you sure this is a " + config.name + " file?");
 
             const parseNum = (s) => parseFloat((s || '0').replace(/,/g, '')) || 0;
-
-            // 1. EXTRACT ALL RAW TRANSACTIONS
             const transactions = [];
             const rows = lines.slice(1).map(line => line.split(',').map(c => c.trim()));
 
@@ -131,7 +127,6 @@
                 if (vals.length < headers.length) return;
                 const sec = vals[idxs.sec];
                 if (!sec) return;
-
                 let dateObj = new Date();
                 const dStr = vals[idxs.date];
                 const tStr = idxs.time !== -1 ? vals[idxs.time] : '00:00:00';
@@ -157,91 +152,59 @@
                 const charges = idxs.charges !== -1 ? parseNum(vals[idxs.charges]) : 0;
                 const typeStr = (vals[idxs.type] || '').toLowerCase();
                 const isBuy = typeStr.includes('buy') || typeStr === 'b' || typeStr === 'dr'; 
-                
-                transactions.push({
-                    sec,
-                    time: dateObj,
-                    qty,
-                    price,
-                    charges,
-                    isBuy
-                });
+                transactions.push({ sec, time: dateObj, qty, price, charges, isBuy });
             });
 
-            // 2. SORT CHRONOLOGICALLY
             transactions.sort((a, b) => a.time - b.time);
-
-            // 3. ROUND TRIP PROCESSING
             const completedTrades = [];
             const openPositions = {}; 
-
             transactions.forEach(txn => {
                 if (!openPositions[txn.sec]) {
-                    openPositions[txn.sec] = { 
-                        qty: 0, netCashflow: 0, charges: 0, entryTime: txn.time, exitTime: txn.time,
-                        totalBuyQty: 0, totalBuyVal: 0, totalSellQty: 0, totalSellVal: 0, direction: txn.isBuy ? 'Long' : 'Short'
-                    };
+                    const symbol = txn.sec.toUpperCase();
+                    const isPE = symbol.includes('PE') || symbol.includes('PUT');
+                    let marketBias = 'Long';
+                    if (txn.isBuy) { if (isPE) marketBias = 'Short'; else marketBias = 'Long'; } 
+                    else { if (isPE) marketBias = 'Long'; else marketBias = 'Short'; }
+                    openPositions[txn.sec] = { qty: 0, netCashflow: 0, charges: 0, entryTime: txn.time, exitTime: txn.time, totalBuyQty: 0, totalBuyVal: 0, totalSellQty: 0, totalSellVal: 0, direction: marketBias };
                 }
-
                 const pos = openPositions[txn.sec];
                 const amount = txn.qty * txn.price;
-                
-                if (txn.isBuy) { 
-                    pos.qty += txn.qty; pos.netCashflow -= amount; 
-                    pos.totalBuyQty += txn.qty; pos.totalBuyVal += amount;
-                } else { 
-                    pos.qty -= txn.qty; pos.netCashflow += amount; 
-                    pos.totalSellQty += txn.qty; pos.totalSellVal += amount;
-                }
-                
-                pos.charges += txn.charges;
-                pos.netCashflow -= txn.charges; 
-                pos.exitTime = txn.time;
-                
+                if (txn.isBuy) { pos.qty += txn.qty; pos.netCashflow -= amount; pos.totalBuyQty += txn.qty; pos.totalBuyVal += amount; } 
+                else { pos.qty -= txn.qty; pos.netCashflow += amount; pos.totalSellQty += txn.qty; pos.totalSellVal += amount; }
+                pos.charges += txn.charges; pos.netCashflow -= txn.charges; pos.exitTime = txn.time;
                 if (Math.abs(pos.qty) < 0.0001) {
                     const tradeQty = Math.max(pos.totalBuyQty, pos.totalSellQty);
                     const avgBuyPrice = pos.totalBuyQty > 0 ? pos.totalBuyVal / pos.totalBuyQty : 0;
                     const avgSellPrice = pos.totalSellQty > 0 ? pos.totalSellVal / pos.totalSellQty : 0;
-
                     completedTrades.push({
-                        id: txn.sec,
-                        netPnL: pos.netCashflow,
-                        charges: pos.charges,
-                        entryTime: pos.entryTime,
-                        exitTime: pos.exitTime,
+                        id: txn.sec, netPnL: pos.netCashflow, charges: pos.charges, entryTime: pos.entryTime, exitTime: pos.exitTime,
                         durationMins: (pos.exitTime - pos.entryTime) / 60000,
                         monthKey: pos.exitTime.toLocaleString('default', { month: 'short', year: '2-digit' }),
-                        dayOfWeek: pos.exitTime.getDay(),
-                        entryHour: pos.entryTime.getHours(),
-                        exitHour: pos.exitTime.getHours(),
+                        dayOfWeek: pos.exitTime.getDay(), entryHour: pos.entryTime.getHours(), exitHour: pos.exitTime.getHours(),
                         dateStr: pos.exitTime.toISOString().split('T')[0],
-                        qty: tradeQty,
-                        entryPrice: pos.direction === 'Long' ? avgBuyPrice : avgSellPrice,
-                        exitPrice: pos.direction === 'Long' ? avgSellPrice : avgBuyPrice,
-                        direction: pos.direction
+                        qty: tradeQty, entryPrice: pos.direction === 'Long' ? avgBuyPrice : avgSellPrice,
+                        exitPrice: pos.direction === 'Long' ? avgSellPrice : avgBuyPrice, direction: pos.direction
                     });
                     delete openPositions[txn.sec];
                 }
             });
-
             if (completedTrades.length === 0) throw new Error("No completed trades found. (Did you close your positions?)");
-
             return processTrades(completedTrades, idxs.charges !== -1);
         };
 
-        // --- METRIC AGGREGATION & LOGIC ---
-        const processTrades = (completedTrades, hasCharges, excludeDayCount = 0) => {
-            
-            // 1. Group by Date to find Bad Days
-            const dailyData = {};
-            completedTrades.forEach(t => {
-                if (!dailyData[t.dateStr]) dailyData[t.dateStr] = { pnl: 0, trades: [], maxRunningPnL: -Infinity, runningPnL: 0 };
-                const d = dailyData[t.dateStr];
-                d.pnl += t.netPnL;
-                d.trades.push(t);
-            });
+        // --- METRIC AGGREGATION ---
+        const processTrades = (completedTrades, hasCharges, excludeDayCount = 0, directionFilter = 'all') => {
+            // 1. Filter Direction
+            let directionFilteredTrades = [...completedTrades];
+            if (directionFilter === 'long') directionFilteredTrades = directionFilteredTrades.filter(t => t.direction === 'Long');
+            else if (directionFilter === 'short') directionFilteredTrades = directionFilteredTrades.filter(t => t.direction === 'Short');
 
-            // Analyze Days
+            // 2. Identify Bad Days on Filtered Data
+            const dailyData = {};
+            directionFilteredTrades.forEach(t => {
+                if (!dailyData[t.dateStr]) dailyData[t.dateStr] = { pnl: 0, trades: [], maxRunningPnL: -Infinity };
+                dailyData[t.dateStr].pnl += t.netPnL; dailyData[t.dateStr].trades.push(t);
+            });
             const dayAnalysis = Object.entries(dailyData).map(([date, data]) => {
                 data.trades.sort((a,b) => a.exitTime - b.exitTime);
                 let currentPnL = 0, maxPnL = 0;
@@ -249,23 +212,21 @@
                 let mistake = "Big Loss";
                 if (data.trades.length > 15) mistake = "Overtrading";
                 else if (maxPnL > 1500 && data.pnl < 0) mistake = "Gave Back Profits";
-                return { dateStr: date, pnl: data.pnl, tradeCount: data.trades.length, mistake, trades: data.trades };
+                return { dateStr: date, pnl: data.pnl, tradeCount: data.trades.length, mistake };
             });
-
             dayAnalysis.sort((a,b) => a.pnl - b.pnl);
 
-            let filteredTrades = [...completedTrades];
+            // 3. Apply Discipline Filter
+            let filteredTrades = [...directionFilteredTrades];
             let excludedDaysList = [];
-
             if (excludeDayCount > 0) {
                 const badDays = dayAnalysis.filter(d => d.pnl < 0).slice(0, excludeDayCount);
                 excludedDaysList = badDays;
-                
                 const excludedDates = new Set(badDays.map(d => d.dateStr));
-                filteredTrades = completedTrades.filter(t => !excludedDates.has(t.dateStr));
+                filteredTrades = directionFilteredTrades.filter(t => !excludedDates.has(t.dateStr));
             }
 
-            // Recalculate Metrics
+            // 4. Calculate Stats
             let wins=0, losses=0, sumWin=0, sumLoss=0, equity=0, peak=0, maxDD=0;
             let durationWin=0, durationLoss=0;
             const equityCurve = [];
@@ -274,18 +235,25 @@
             const entryHourStats = Array(24).fill(null).map(() => ({ pnl: 0, count: 0 }));
             const exitHourStats = Array(24).fill(null).map(() => ({ pnl: 0, count: 0 }));
             const instrumentStats = {};
+            const directionStats = { Long: { pnl: 0, trades: 0, wins: 0 }, Short: { pnl: 0, trades: 0, wins: 0 } };
 
             filteredTrades.sort((a,b) => a.exitTime - b.exitTime);
 
             filteredTrades.forEach(t => {
                 if (!monthlyStats[t.monthKey]) monthlyStats[t.monthKey] = { pnl: 0, trades: 0, wins: 0, sumWin: 0, sumLoss: 0 };
-                monthlyStats[t.monthKey].pnl += t.netPnL;
-                monthlyStats[t.monthKey].trades++;
-                dayStats[t.dayOfWeek].pnl += t.netPnL;
-                dayStats[t.dayOfWeek].count++;
+                monthlyStats[t.monthKey].pnl += t.netPnL; monthlyStats[t.monthKey].trades++;
+                dayStats[t.dayOfWeek].pnl += t.netPnL; dayStats[t.dayOfWeek].count++;
                 if(t.entryHour >= 0 && t.entryHour < 24) { entryHourStats[t.entryHour].pnl += t.netPnL; entryHourStats[t.entryHour].count++; }
                 if(t.exitHour >= 0 && t.exitHour < 24) { exitHourStats[t.exitHour].pnl += t.netPnL; exitHourStats[t.exitHour].count++; }
 
+                // Direction Stats (Filtered View)
+                if (t.direction && directionStats[t.direction]) {
+                    directionStats[t.direction].pnl += t.netPnL;
+                    directionStats[t.direction].trades++;
+                    if (t.netPnL > 0) directionStats[t.direction].wins++;
+                }
+
+                // Instrument Stats
                 let symbolRoot = t.id;
                 const upperId = t.id.toUpperCase();
                 if (upperId.includes('BANKNIFTY')) symbolRoot = 'BANKNIFTY';
@@ -295,36 +263,29 @@
                 else if (upperId.includes('SENSEX')) symbolRoot = 'SENSEX';
                 else if (upperId.includes('BANKEX')) symbolRoot = 'BANKEX';
                 else { const match = symbolRoot.match(/^([A-Z\s]+)/); if (match) symbolRoot = match[1].trim(); }
-
                 if(!instrumentStats[symbolRoot]) instrumentStats[symbolRoot] = { pnl: 0, trades: 0 };
-                instrumentStats[symbolRoot].pnl += t.netPnL;
-                instrumentStats[symbolRoot].trades++;
+                instrumentStats[symbolRoot].pnl += t.netPnL; instrumentStats[symbolRoot].trades++;
 
-                equity += t.netPnL;
-                peak = Math.max(peak, equity);
-                const dd = equity - peak;
-                maxDD = Math.min(maxDD, dd);
-
+                equity += t.netPnL; peak = Math.max(peak, equity); const dd = equity - peak; maxDD = Math.min(maxDD, dd);
                 equityCurve.push({ x: t.dateStr, y: equity });
-
-                if (t.netPnL > 0) {
-                    wins++; sumWin += t.netPnL; 
-                    monthlyStats[t.monthKey].wins++; monthlyStats[t.monthKey].sumWin += t.netPnL;
-                    dayStats[t.dayOfWeek].wins++; durationWin += t.durationMins;
-                } else {
-                    losses++; sumLoss += Math.abs(t.netPnL);
-                    monthlyStats[t.monthKey].sumLoss += Math.abs(t.netPnL);
-                    durationLoss += t.durationMins;
-                }
+                if (t.netPnL > 0) { wins++; sumWin += t.netPnL; monthlyStats[t.monthKey].wins++; monthlyStats[t.monthKey].sumWin += t.netPnL; dayStats[t.dayOfWeek].wins++; durationWin += t.durationMins; } 
+                else { losses++; sumLoss += Math.abs(t.netPnL); monthlyStats[t.monthKey].sumLoss += Math.abs(t.netPnL); durationLoss += t.durationMins; }
             });
 
-            // ORIGINAL EQUITY CURVE GENERATION (For comparison)
-            let origEquity = 0;
+            // Calculate Base Reality PnL for Discipline Slider Comparison (Respects Direction Filter, ignores Discipline)
+            let baseRealityPnL = 0;
             const originalCurve = [];
-            const allSorted = [...completedTrades].sort((a,b) => a.exitTime - b.exitTime);
-            allSorted.forEach(t => {
-                origEquity += t.netPnL;
-                originalCurve.push({ x: t.dateStr, y: origEquity });
+            const baseSorted = [...directionFilteredTrades].sort((a,b) => a.exitTime - b.exitTime);
+            baseSorted.forEach(t => { baseRealityPnL += t.netPnL; originalCurve.push({ x: t.dateStr, y: baseRealityPnL }); });
+
+            // Calculate FULL Direction Stats (Ignoring all filters, for the "Long vs Short" chart)
+            const fullDirectionStats = { Long: { pnl: 0, trades: 0, wins: 0 }, Short: { pnl: 0, trades: 0, wins: 0 } };
+            completedTrades.forEach(t => {
+                 if (t.direction && fullDirectionStats[t.direction]) {
+                    fullDirectionStats[t.direction].pnl += t.netPnL;
+                    fullDirectionStats[t.direction].trades++;
+                    if (t.netPnL > 0) fullDirectionStats[t.direction].wins++;
+                }
             });
 
             const totalPnL = equity; 
@@ -335,32 +296,28 @@
             const profitFactor = sumLoss ? sumWin/sumLoss : 0;
             const expectancy = (winRate/100 * avgWin) - ((100-winRate)/100 * avgLoss);
             const rrRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
-            const avgTradesPerDay = totalTrades / (new Set(filteredTrades.map(t => t.dateStr)).size || 1);
-            const avgHoldWin = wins ? durationWin/wins : 0;
-            const avgHoldLoss = losses ? durationLoss/losses : 0;
-
-            const review = generateReview(completedTrades);
-
+            const review = generateReview(filteredTrades, equity); // Generate review based on filtered view
             const sortedInstruments = Object.entries(instrumentStats).map(([name, s]) => ({ name, ...s })).sort((a,b) => b.pnl - a.pnl);
 
             return {
-                trades: completedTrades,
+                trades: completedTrades, // Keep full log
                 excludedDays: excludedDaysList,
                 filteredTradesCount: filteredTrades.length,
-                equityCurve, 
-                originalCurve, 
-                monthlyStats, dayStats, entryHourStats, exitHourStats, instrumentStats: sortedInstruments, review,
+                baseRealityPnL, // PnL before discipline filter
+                equityCurve, originalCurve, monthlyStats, dayStats, entryHourStats, exitHourStats, 
+                instrumentStats: sortedInstruments, 
+                directionStats: fullDirectionStats, // Show global stats in chart
+                review,
                 metrics: { totalTrades, winRate, totalPnL, maxDD, avgWin, avgLoss, profitFactor, rrRatio, expectancy },
                 hasCharges
             };
         };
 
-        const generateReview = (trades) => {
+        const generateReview = (trades, finalEquity) => {
             let wins=0, losses=0, sumWin=0, sumLoss=0, equity=0, peak=0, maxDD=0;
             let durationWin=0, durationLoss=0;
             const dayStats = Array(7).fill(null).map(() => ({ pnl: 0, count: 0 }));
             const entryHourStats = Array(24).fill(null).map(() => ({ pnl: 0 }));
-            trades.sort((a,b) => a.exitTime - b.exitTime);
             let currentWinStreak = 0; let streakBlowoutCount = 0; let revengeTradeCount = 0; let revengeLossCount = 0; 
 
             for (let i = 0; i < trades.length; i++) {
@@ -386,18 +343,15 @@
 
             const totalTrades = trades.length;
             const winRate = totalTrades ? (wins/totalTrades)*100 : 0;
-            const avgWin = wins ? sumWin/wins : 0;
-            const avgLoss = losses ? sumLoss/losses : 0;
             const profitFactor = sumLoss ? sumWin/sumLoss : 0;
-            const rrRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
+            const avgTradesPerDay = totalTrades / (new Set(trades.map(t => t.dateStr)).size || 1);
             const avgHoldWin = wins ? durationWin/wins : 0;
             const avgHoldLoss = losses ? durationLoss/losses : 0;
-            const avgTradesPerDay = totalTrades / (new Set(trades.map(t => t.dateStr)).size || 1);
+            const rrRatio = (losses > 0 && sumLoss > 0) ? (sumWin/wins) / (sumLoss/losses) : 0;
 
             const review = { grade: "C", title: "Developing", color: "text-slate-600", bg: "bg-slate-100", strategic: [], behavioral: [], actionable: [] };
-
-            if (equity > 0) {
-                if (profitFactor > 2.0 && maxDD > -(equity * 0.1)) { review.grade = "A+"; review.title = "Market Master"; review.color="text-emerald-600"; review.bg="bg-emerald-50"; }
+            if (finalEquity > 0) {
+                if (profitFactor > 2.0 && maxDD > -(finalEquity * 0.1)) { review.grade = "A+"; review.title = "Market Master"; review.color="text-emerald-600"; review.bg="bg-emerald-50"; }
                 else if (profitFactor > 1.5) { review.grade = "A"; review.title = "Solid Performer"; review.color="text-emerald-600"; review.bg="bg-emerald-50"; }
                 else if (profitFactor > 1.2) { review.grade = "B"; review.title = "Consistent"; review.color="text-blue-600"; review.bg="bg-blue-50"; }
                 else { review.grade = "B-"; review.title = "Marginally Profitable"; review.color="text-blue-600"; review.bg="bg-blue-50"; }
@@ -410,50 +364,19 @@
             else if (winRate < 40 && rrRatio > 2.0) review.strategic.push("Sniper Profile Detected: You have a lower win rate, but your winners are massive compared to losers. This is a stressful but professionally valid style. The key is surviving the losing streaks without changing your rules.");
             else if (winRate > 60 && rrRatio < 0.8) review.strategic.push("Scalper Profile Detected: You rely on high accuracy to make money. However, your Reward:Risk is inverted (losses are bigger than wins). One bad day can wipe out a week of progress. You must tighten your Stop Loss.");
             else review.strategic.push("Balanced Strategy: Your Win Rate and Risk:Reward are in a healthy equilibrium. Focus on increasing position size slowly rather than changing the strategy.");
-            
             if (avgHoldLoss > avgHoldWin * 1.5) review.strategic.push(`Hope Trading Detected: You hold losers (${Math.round(avgHoldLoss)}m) much longer than winners (${Math.round(avgHoldWin)}m).`);
-
             if (streakBlowoutCount > 0) review.behavioral.push(`Winner's Tilt: Detected ${streakBlowoutCount} instances of massive losses immediately following a 3+ winning streak. You likely relax your risk rules when you feel 'invincible'. Be careful of overconfidence.`);
             if (revengeTradeCount > 2) { const failRate = Math.round((revengeLossCount / revengeTradeCount) * 100); review.behavioral.push(`Revenge Trading Loop: You frequently re-enter the market within 15 minutes of a loss (${revengeTradeCount} times). ${failRate}% of these impulsive trades resulted in further losses. You are trading your P&L, not the chart setup.`); }
             if (avgTradesPerDay > 10) review.behavioral.push("Over-trading Alert: You are averaging over 10 trades per session. Unless you are an algo, this leads to decision fatigue and high brokerage costs. Try to limit yourself to the 3 best setups per day.");
-            
             let worstDayIdx = -1, worstDayPnL = Infinity; dayStats.forEach((d, i) => { if (i>0 && i<6 && d.count>3 && d.pnl < worstDayPnL) { worstDayPnL = d.pnl; worstDayIdx = i; } });
             if (worstDayPnL < 0) review.behavioral.push(`Calendar Weakness: You have a statistically significant leak on ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][worstDayIdx]}s. This could be due to weekly expiry volatility or end-of-week fatigue. Consider reducing size on this day.`);
-            
             const morningPnL = (entryHourStats[9]?.pnl || 0) + (entryHourStats[10]?.pnl || 0);
-            if (morningPnL < -Math.abs(equity * 0.1)) review.behavioral.push("Morning Chaos: You are losing money in the opening hour (9-11 AM). This is the most volatile time. Consider waiting until 10:30 AM for price action to settle.");
-
+            if (morningPnL < -Math.abs(finalEquity * 0.1)) review.behavioral.push("Morning Chaos: You are losing money in the opening hour (9-11 AM). This is the most volatile time. Consider waiting until 10:30 AM for price action to settle.");
             if (profitFactor < 1.0) review.actionable.push("Capital Preservation Mode: Stop increasing your position size. Do not add funds until your Profit Factor crosses 1.2 for at least 30 consecutive trades.");
             if (rrRatio < 1.0) review.actionable.push("Hard Stop Loss: Your average loss is larger than your average win. Implement a mechanical Hard Stop in the system that auto-exits trades to prevent emotional holding.");
             else review.actionable.push("Maximize Winners: Your risk management is decent. Now focus on 'Trailing Stops' to let your winning trades run longer and improve expectancy.");
             if (avgHoldLoss > avgHoldWin) review.actionable.push(`Time-Based Exit: If a trade is not profitable within ${Math.round(avgHoldWin)} mins, close it immediately. Do not give it 'more room' if it's acting sluggish.`);
-
             return review;
-        };
-
-        // --- COMPONENTS ---
-        const DisciplineSlider = ({ value, onChange, originalPnL, newPnL, excludedDays }) => {
-            const diff = newPnL - originalPnL;
-            const pnlColor = newPnL >= 0 ? "text-emerald-600" : "text-rose-600";
-            return (
-                <div className="card p-6 mb-8 border-l-4 border-l-purple-500 bg-gradient-to-r from-white to-purple-50/30 print-break">
-                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
-                        <div><h3 className="font-bold text-slate-900 flex items-center gap-2"><Icon name="sliders" size={20} className="text-purple-600"/> Discipline Simulator</h3><p className="text-sm text-slate-500 mt-1">What if you skipped your worst days?</p></div>
-                        <div className="text-right"><span className="text-xs font-bold text-slate-400 uppercase">Potential P&L</span><div className={`text-2xl font-bold ${pnlColor}`}>₹{newPnL.toLocaleString('en-IN', {maximumFractionDigits:0})}</div>{diff > 0 && <span className="text-xs font-semibold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full">+{diff.toLocaleString()} improvement</span>}</div>
-                    </div>
-                    <div className="relative pt-6 pb-2 px-2">
-                        <input type="range" min="0" max="5" step="1" value={value} onChange={(e) => onChange(parseInt(e.target.value))} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600" />
-                        <div className="flex justify-between text-xs text-slate-400 font-bold mt-2 uppercase tracking-wide"><span>Reality</span><span>Skip 1 Bad Day</span><span>Skip 3 Bad Days</span><span>Skip 5 Bad Days</span></div>
-                        <div className="absolute -top-1 left-0 right-0 flex justify-center pointer-events-none"><span className="bg-slate-900 text-white text-xs font-bold px-3 py-1 rounded-full shadow-lg transform -translate-y-full">Excluding {value} Worst {value === 1 ? 'Day' : 'Days'}</span></div>
-                    </div>
-                    {excludedDays && excludedDays.length > 0 && (
-                        <div className="mt-6 bg-rose-50 rounded-xl border border-rose-100 overflow-hidden shadow-sm">
-                            <div className="px-4 py-3 border-b border-rose-100 flex justify-between items-center bg-rose-50/50"><h4 className="text-sm font-bold text-rose-800 flex items-center gap-2"><Icon name="calendar-x" size={16}/> Excluded "Bad Days"</h4><span className="text-xs text-rose-600 font-medium">Reflect on these sessions</span></div>
-                            <table className="w-full text-xs text-left"><thead className="text-rose-500 font-semibold border-b border-rose-100 bg-rose-50"><tr><th className="px-4 py-2">Date</th><th className="px-4 py-2 text-right">Trades</th><th className="px-4 py-2">Mistake</th><th className="px-4 py-2 text-right">Loss</th></tr></thead><tbody className="divide-y divide-rose-100 bg-white">{excludedDays.map((d, i) => <tr key={i} className="hover:bg-rose-50 transition"><td className="px-4 py-2 text-rose-900 font-medium">{d.dateStr}</td><td className="px-4 py-2 text-right text-rose-800">{d.tradeCount}</td><td className="px-4 py-2"><span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase ${d.mistake === 'Overtrading' ? 'bg-orange-100 text-orange-700' : d.mistake === 'Gave Back Profits' ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{d.mistake}</span></td><td className="px-4 py-2 text-right font-bold text-rose-600">{d.pnl.toLocaleString('en-IN', {maximumFractionDigits:0})}</td></tr>)}</tbody></table>
-                        </div>
-                    )}
-                </div>
-            );
         };
 
         const MetricCard = ({ label, value, trend, icon, desc }) => (
@@ -481,10 +404,68 @@
             </div>
         );
 
+        const DisciplineSlider = ({ value, onChange, originalPnL, newPnL, excludedDays }) => {
+            const diff = newPnL - originalPnL;
+            const pnlColor = newPnL >= 0 ? "text-emerald-600" : "text-rose-600";
+            return (
+                <div className="card p-6 mb-8 border-l-4 border-l-purple-500 bg-gradient-to-r from-white to-purple-50/30 print-break">
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
+                        <div><h3 className="font-bold text-slate-900 flex items-center gap-2"><Icon name="sliders" size={20} className="text-purple-600"/> Discipline Simulator</h3><p className="text-sm text-slate-500 mt-1">What if you skipped your worst days?</p></div>
+                        <div className="text-right"><span className="text-xs font-bold text-slate-400 uppercase">Potential P&L</span><div className={`text-2xl font-bold ${pnlColor}`}>₹{newPnL.toLocaleString('en-IN', {maximumFractionDigits:0})}</div>{diff > 0 && <span className="text-xs font-semibold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full">+{diff.toLocaleString()} improvement</span>}</div>
+                    </div>
+                    <div className="relative pt-6 pb-2 px-2">
+                        <input type="range" min="0" max="5" step="1" value={value} onChange={(e) => onChange(parseInt(e.target.value))} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600" />
+                        <div className="flex justify-between text-xs text-slate-400 font-bold mt-2 uppercase tracking-wide"><span>Reality</span><span>Skip 1 Bad Day</span><span>Skip 3 Bad Days</span><span>Skip 5 Bad Days</span></div>
+                        <div className="absolute -top-1 left-0 right-0 flex justify-center pointer-events-none"><span className="bg-slate-900 text-white text-xs font-bold px-3 py-1 rounded-full shadow-lg transform -translate-y-full">Excluding {value} Worst {value === 1 ? 'Day' : 'Days'}</span></div>
+                    </div>
+                    {excludedDays && excludedDays.length > 0 && (
+                        <div className="mt-6 bg-rose-50 rounded-xl border border-rose-100 overflow-hidden shadow-sm">
+                            <div className="px-4 py-3 border-b border-rose-100 flex justify-between items-center bg-rose-50/50"><h4 className="text-sm font-bold text-rose-800 flex items-center gap-2"><Icon name="calendar-x" size={16}/> Excluded "Bad Days"</h4><span className="text-xs text-rose-600 font-medium">Reflect on these sessions</span></div>
+                            <table className="w-full text-xs text-left"><thead className="text-rose-500 font-semibold border-b border-rose-100 bg-rose-50"><tr><th className="px-4 py-2">Date</th><th className="px-4 py-2 text-right">Trades</th><th className="px-4 py-2">Mistake</th><th className="px-4 py-2 text-right">Loss</th></tr></thead><tbody className="divide-y divide-rose-100 bg-white">{excludedDays.map((d, i) => <tr key={i} className="hover:bg-rose-50 transition"><td className="px-4 py-2 text-rose-900 font-medium">{d.dateStr}</td><td className="px-4 py-2 text-right text-rose-800">{d.tradeCount}</td><td className="px-4 py-2"><span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase ${d.mistake === 'Overtrading' ? 'bg-orange-100 text-orange-700' : d.mistake === 'Gave Back Profits' ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{d.mistake}</span></td><td className="px-4 py-2 text-right font-bold text-rose-600">{d.pnl.toLocaleString('en-IN', {maximumFractionDigits:0})}</td></tr>)}</tbody></table>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const DirectionSimulator = ({ filter, setFilter, simulatedPnL, diff }) => {
+            const pnlColor = simulatedPnL >= 0 ? "text-emerald-600" : "text-rose-600";
+            return (
+                <div className="card p-6">
+                    <h3 className="font-bold text-slate-900 mb-4 flex items-center gap-2"><Icon name="git-merge" size={20} className="text-teal-600"/> Direction Simulator</h3>
+                    <div className="flex flex-col gap-4">
+                        <div className="flex bg-slate-100 rounded-lg p-1">
+                            {['all', 'long', 'short'].map(f => (
+                                <button key={f} onClick={() => setFilter(f)} className={`flex-1 py-2 px-3 rounded-md text-xs font-bold transition-all ${filter === f ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>{f === 'all' ? 'Reality' : f === 'long' ? 'Only Long' : 'Only Short'}</button>
+                            ))}
+                        </div>
+                        <div className="bg-slate-50 rounded-xl p-4 border border-slate-100 text-center"><span className="text-xs font-bold text-slate-400 uppercase">Simulated Net P&L</span><div className={`text-3xl font-extrabold my-1 ${pnlColor}`}>₹{simulatedPnL.toLocaleString('en-IN', {maximumFractionDigits:0})}</div>{filter !== 'all' && <span className={`text-xs font-bold px-2 py-1 rounded-full ${diff > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{diff > 0 ? '+' : ''}{diff.toLocaleString()} difference</span>}{filter === 'all' && <span className="text-xs text-slate-400">Select a filter to simulate</span>}</div>
+                        <div className="text-xs text-slate-500 leading-relaxed">{filter === 'long' && "Showing ONLY Long trades. If profit increases, your Short setups are the problem."}{filter === 'short' && "Showing ONLY Short trades. If profit increases, your Long setups are the problem."}{filter === 'all' && "Compare your Long vs Short performance to find your bias."}</div>
+                    </div>
+                </div>
+            );
+        };
+
+        const DirectionAnalysis = ({ stats }) => {
+            const long = stats.Long;
+            const short = stats.Short;
+            const longWinRate = long.trades > 0 ? (long.wins / long.trades) * 100 : 0;
+            const shortWinRate = short.trades > 0 ? (short.wins / short.trades) * 100 : 0;
+            const maxPnL = Math.max(Math.abs(long.pnl), Math.abs(short.pnl)) || 1;
+            return (
+                <div className="card p-6">
+                    <h3 className="font-bold text-slate-900 mb-6 flex items-center gap-2"><Icon name="arrow-left-right" size={20} className="text-indigo-600" /> Long vs. Short Analysis</h3>
+                    <div className="flex justify-center items-end h-40 gap-16">
+                        <div className="w-16 flex flex-col items-center group relative h-full justify-end"><div className="absolute bottom-full mb-2 opacity-0 group-hover:opacity-100 transition bg-slate-800 text-white text-xs py-1 px-2 rounded whitespace-nowrap z-10 pointer-events-none shadow-xl">{long.trades} trades, {longWinRate.toFixed(0)}% WR</div><div className="w-full bg-slate-100 rounded-t-full h-full relative overflow-hidden"><div className={`absolute bottom-0 left-0 right-0 transition-all duration-500 ${long.pnl >= 0 ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ height: `${Math.max((Math.abs(long.pnl) / maxPnL) * 100, 2)}%` }}></div></div><div className="mt-2 text-center"><div className="text-sm font-bold text-slate-700">Long</div><div className={`text-xs font-semibold ${long.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>₹{long.pnl.toLocaleString()}</div></div></div>
+                        <div className="w-16 flex flex-col items-center group relative h-full justify-end"><div className="absolute bottom-full mb-2 opacity-0 group-hover:opacity-100 transition bg-slate-800 text-white text-xs py-1 px-2 rounded whitespace-nowrap z-10 pointer-events-none shadow-xl">{short.trades} trades, {shortWinRate.toFixed(0)}% WR</div><div className="w-full bg-slate-100 rounded-t-full h-full relative overflow-hidden"><div className={`absolute bottom-0 left-0 right-0 transition-all duration-500 ${short.pnl >= 0 ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ height: `${Math.max((Math.abs(short.pnl) / maxPnL) * 100, 2)}%` }}></div></div><div className="mt-2 text-center"><div className="text-sm font-bold text-slate-700">Short</div><div className={`text-xs font-semibold ${short.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>₹{short.pnl.toLocaleString()}</div></div></div>
+                    </div>
+                </div>
+            );
+        };
+
         const DayAnalysis = ({ stats }) => {
             const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-            const workWeekStats = stats.slice(1, 6); 
-            const maxPnL = Math.max(...workWeekStats.map(s => Math.abs(s.pnl))) || 1;
+            const workWeekStats = stats.slice(1, 6); const maxPnL = Math.max(...workWeekStats.map(s => Math.abs(s.pnl))) || 1;
             return (
                 <div className="card p-6"><h3 className="font-bold text-slate-900 mb-6 flex items-center gap-2"><Icon name="calendar-days" size={20} className="text-slate-600" /> Day-wise Performance</h3><div className="h-40 flex items-end gap-2 mb-2">{workWeekStats.map((s, i) => { const height = (Math.abs(s.pnl) / maxPnL) * 100; const displayHeight = Math.max(height, 2); const barColor = s.pnl >= 0 ? 'bg-emerald-500' : 'bg-rose-500'; return (<div key={i} className="w-1/5 h-full flex flex-col justify-end group relative"><div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 opacity-0 group-hover:opacity-100 transition bg-slate-800 text-white text-xs py-1 px-2 rounded whitespace-nowrap z-10 pointer-events-none shadow-xl">₹{s.pnl.toLocaleString()} <br/> ({s.wins}/{s.count} wins)</div><div className={`w-full rounded-t-md transition-all duration-500 relative ${barColor} opacity-90 hover:opacity-100`} style={{ height: `${displayHeight}%` }}></div></div>); })}</div><div className="flex gap-2 text-xs font-bold text-slate-400 text-center">{['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].map((day, i) => <div key={i} className="w-1/5">{day}</div>)}</div></div>
             );
@@ -544,7 +525,7 @@
                 }
 
                 datasets.push({ 
-                    label: isFiltered ? 'Optimized' : 'Equity', 
+                    label: isFiltered ? 'Simulated' : 'Equity', 
                     data: curve.map(d => d.y), 
                     borderColor: '#2563eb', 
                     backgroundColor: gradient, 
@@ -588,11 +569,11 @@
             const [selectedBroker, setSelectedBroker] = useState(null);
             const [data, setData] = useState(null);
             const [error, setError] = useState(null);
-            const [disciplineLevel, setDisciplineLevel] = useState(0); // 0 = Reality
+            const [disciplineLevel, setDisciplineLevel] = useState(0); 
+            const [directionFilter, setDirectionFilter] = useState('all'); // NEW State
             const fileRef = useRef(null);
             const uploadSectionRef = useRef(null); 
             
-            // Store RAW trade data so we can re-process when slider changes
             const [rawTrades, setRawTrades] = useState(null);
             const [hasCharges, setHasCharges] = useState(true);
 
@@ -600,17 +581,13 @@
                 if (selectedBroker && uploadSectionRef.current) uploadSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }, [selectedBroker]);
 
-            // Re-process metrics when discipline level changes
             useEffect(() => {
                 if (rawTrades) {
-                    const newData = processTrades(rawTrades, hasCharges, disciplineLevel);
-                    if (disciplineLevel > 0) {
-                        // Keep original review
-                        newData.review = data.review; 
-                    }
+                    const newData = processTrades(rawTrades, hasCharges, disciplineLevel, directionFilter);
+                    if (disciplineLevel > 0) newData.review = data.review; 
                     setData(newData);
                 }
-            }, [disciplineLevel]);
+            }, [disciplineLevel, directionFilter]); 
 
             const handleFile = (e) => {
                 const file = e.target.files[0];
@@ -619,11 +596,12 @@
                 reader.onload = (ev) => {
                     try {
                         const result = parseTradeData(ev.target.result, selectedBroker);
-                        setRawTrades(result.trades); // Store raw
+                        setRawTrades(result.trades); 
                         setHasCharges(result.hasCharges);
                         setData(result);
                         setError(null);
-                        setDisciplineLevel(0); // Reset slider
+                        setDisciplineLevel(0); 
+                        setDirectionFilter('all');
                     } catch (err) { setError(err.message); setData(null); }
                 };
                 reader.readAsText(file);
@@ -657,13 +635,12 @@
                     setSelectedBroker('zerodha');
                     setError(null);
                     setDisciplineLevel(0);
+                    setDirectionFilter('all');
                 } catch (e) { setError("Could not load demo data: " + e.message); }
             };
 
             const handleReload = () => window.location.reload();
-
-            // Calculate Reality PnL for comparison
-            const realityPnL = rawTrades ? rawTrades.reduce((acc, t) => acc + t.netPnL, 0) : 0;
+            const currentRealityPnL = data && data.baseRealityPnL ? data.baseRealityPnL : 0;
 
             return (
                 <div className="min-h-screen pb-20 flex flex-col bg-slate-50/50">
@@ -716,7 +693,7 @@
                                 </div>
 
                                 <DetailedReview review={data.review} />
-                                <DisciplineSlider value={disciplineLevel} onChange={setDisciplineLevel} originalPnL={realityPnL} newPnL={data.metrics.totalPnL} excludedDays={data.excludedDays} />
+                                <DisciplineSlider value={disciplineLevel} onChange={setDisciplineLevel} originalPnL={currentRealityPnL} newPnL={data.metrics.totalPnL} excludedDays={data.excludedDays} />
 
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
                                     <MetricCard label="Net P&L" value={`₹ ${data.metrics.totalPnL.toLocaleString()}`} trend={data.metrics.totalPnL > 0 ? 'good' : 'bad'} icon="wallet" desc={METRIC_INFO["Net P&L"]} />
@@ -744,6 +721,11 @@
                                     <DayAnalysis stats={data.dayStats} />
                                     <DetailedHourlyChart title="Entry Hour Performance" stats={data.entryHourStats} />
                                     <DetailedHourlyChart title="Exit Hour Performance" stats={data.exitHourStats} />
+                                </div>
+
+                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 print-break">
+                                    <DirectionAnalysis stats={data.directionStats} />
+                                    <DirectionSimulator filter={directionFilter} setFilter={setDirectionFilter} simulatedPnL={data.metrics.totalPnL} diff={data.metrics.totalPnL - currentRealityPnL} />
                                 </div>
 
                                 <MonthlyTable stats={data.monthlyStats} />
