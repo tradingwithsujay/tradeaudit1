@@ -30,6 +30,18 @@
         .tooltip { visibility: hidden; opacity: 0; transition: opacity 0.2s; }
         .has-tooltip:hover .tooltip { visibility: visible; opacity: 1; }
         
+        /* FAQ Animation */
+        .faq-content {
+            transition: max-height 0.3s ease-in-out, opacity 0.3s ease-in-out;
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+        }
+        .faq-content.open {
+            max-height: 500px; /* Arbitrary large height */
+            opacity: 1;
+        }
+
         /* Print Styles */
         @media print {
             body { background-color: white; }
@@ -58,6 +70,16 @@
             "Avg Loss": "The average loss amount of your losing trades."
         };
 
+        const MAPPING_HELP = {
+            security: "The column containing the name of the stock or option (e.g., 'NIFTY 25000 CE', 'RELIANCE').",
+            date: "The date the trade was executed (e.g., '2023-10-25' or '25/10/2023').",
+            time: "The exact time of the trade (e.g., '10:30:05'). Optional if Date includes time.",
+            type: "Indicates if the trade was a 'Buy' or 'Sell' transaction.",
+            qty: "The number of shares or lots traded.",
+            price: "The price at which the trade was executed.",
+            charges: "Any brokerage, taxes, or fees associated with the trade (Optional)."
+        };
+
         // --- BROKER CONFIGURATIONS ---
         const BROKERS = {
             kotak: {
@@ -75,20 +97,10 @@
                 mappings: { security: "Name", date: "Date", time: "Time", type: "Buy/Sell", qty: "Quantity/Lot", price: "Trade Price", charges: null },
                 dateFmt: "yyyy-mm-dd"
             },
-            angel: {
-                id: 'angel', name: "Angel One", color: "text-orange-600", bg: "bg-orange-50",
-                mappings: { security: "Symbol", date: "Trade Date", time: "Order Time", type: "Trade Type", qty: "Quantity", price: "Price" },
-                dateFmt: "dd-mm-yyyy"
-            },
-            upstox: {
-                id: 'upstox', name: "Upstox", color: "text-indigo-600", bg: "bg-indigo-50",
-                mappings: { security: "Scrip Name", date: "Date", time: "Time", type: "Type", qty: "Qty", price: "Price" },
-                dateFmt: "dd/mm/yyyy"
-            },
-            groww: {
-                id: 'groww', name: "Groww", color: "text-emerald-600", bg: "bg-emerald-50",
-                mappings: { security: "Stock Name", date: "Date", time: null, type: "Type", qty: "Qty", price: "Avg Price" },
-                dateFmt: "dd-mm-yyyy"
+            other: {
+                id: 'other', name: "Other Broker", color: "text-slate-600", bg: "bg-slate-50",
+                mappings: null, 
+                dateFmt: "auto"
             }
         };
 
@@ -97,19 +109,75 @@
             return <i data-lucide={name} width={size} height={size} className={className}></i>;
         };
 
-        // --- PARSING ENGINE (ROUND TRIP) ---
-        const parseTradeData = (text, brokerId) => {
-            const config = BROKERS[brokerId];
-            const map = config.mappings;
-            const lines = text.split('\n').filter(l => l.trim());
-            if (lines.length < 2) throw new Error("File appears empty or invalid.");
+        const FAQItem = ({ question, answer }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            return (
+                <div className="border-b border-slate-100 last:border-0">
+                    <button 
+                        onClick={() => setIsOpen(!isOpen)} 
+                        className="w-full text-left py-4 px-2 flex justify-between items-center text-slate-800 font-semibold hover:text-blue-600 transition group focus:outline-none"
+                    >
+                        <span>{question}</span>
+                        <span className={`transform transition-transform duration-300 ${isOpen ? 'rotate-180 text-blue-600' : 'text-slate-400 group-hover:text-blue-600'}`}>
+                            <Icon name="chevron-down" size={18} />
+                        </span>
+                    </button>
+                    <div className={`faq-content px-2 text-slate-600 text-sm leading-relaxed ${isOpen ? 'open' : ''}`}>
+                        <div className="pb-4">{answer}</div>
+                    </div>
+                </div>
+            );
+        };
 
-            const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+        // --- PARSING ENGINE ---
+        const parseTradeData = (text, brokerId, customMappings = null) => {
+            const config = BROKERS[brokerId];
+            const map = customMappings || config.mappings;
+            
+            // 1. CLEAN & SPLIT LINES
+            const rawLines = text.split('\n').map(l => l.trim()).filter(l => l);
+            if (rawLines.length < 2) throw new Error("File appears empty or invalid.");
+
+            // 2. SMART HEADER DETECTION
+            let headerIdx = -1;
+            let headers = [];
+            // More comprehensive keyword list
+            const keywords = ['symbol', 'security', 'script', 'quantity', 'qty', 'price', 'rate', 'date', 'time', 'buy', 'transaction', 'trade_date', 'order_execution_time'];
+            
+            for (let i = 0; i < Math.min(rawLines.length, 20); i++) {
+                // Remove quotes, lower case, split by comma
+                const lineCols = rawLines[i].toLowerCase().replace(/"/g, '').split(',').map(c => c.trim());
+                
+                // Count how many keywords exist in this row
+                const matches = lineCols.filter(col => 
+                    keywords.some(k => col === k || col.includes(k)) // Exact or partial match
+                ).length;
+
+                // Heuristic: If we find at least 3 matching columns, it's likely the header
+                if (matches >= 3) {
+                    headerIdx = i;
+                    headers = lineCols;
+                    break;
+                }
+            }
+
+            if (headerIdx === -1) {
+                // Fallback: Use first line
+                headerIdx = 0;
+                headers = rawLines[0].toLowerCase().replace(/"/g, '').split(',').map(c => c.trim());
+            }
+
+            // 3. COLUMN MAPPING
             const getIdx = (key) => {
                 if (!key) return -1;
-                const exact = lines[0].split(',').findIndex(h => h.trim() === key);
-                if (exact !== -1) return exact;
-                return headers.indexOf(key.toLowerCase());
+                const lowerKey = key.toLowerCase();
+                // 1. Exact match
+                let idx = headers.indexOf(lowerKey);
+                // 2. Partial match if exact failed
+                if (idx === -1) {
+                    idx = headers.findIndex(h => h.includes(lowerKey));
+                }
+                return idx;
             };
 
             const idxs = {
@@ -118,48 +186,67 @@
             };
 
             if (idxs.sec === -1 || idxs.qty === -1 || idxs.price === -1) {
-                throw new Error(`Column mismatch. Are you sure this is a ${config.name} file? Missing columns.`);
+                throw new Error("Mapping Error: Could not find required columns. Please check your mapping.");
             }
 
-            const parseNum = (s) => parseFloat((s || '0').replace(/,/g, '')) || 0;
+            const parseNum = (s) => {
+                if (typeof s === 'number') return s;
+                if (!s) return 0;
+                return parseFloat(s.replace(/,/g, '')) || 0;
+            };
 
-            // 1. EXTRACT ALL RAW TRANSACTIONS
+            // 4. EXTRACT TRANSACTIONS
             const transactions = [];
-            const rows = lines.slice(1).map(line => line.split(',').map(c => c.trim()));
+            const dataRows = rawLines.slice(headerIdx + 1);
 
-            rows.forEach(vals => {
-                if (vals.length < headers.length) return;
+            dataRows.forEach(line => {
+                // Clean split: remove surrounding quotes from values
+                // Regex matches comma not inside quotes would be better, but for simple CSVs:
+                // We'll assume simple splitting for now, but handle basic quotes strip.
+                const vals = line.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+                
+                if (vals.length < headers.length) return; // Skip malformed lines
+
                 const sec = vals[idxs.sec];
-                if (!sec) return;
+                if (!sec) return; // Skip lines without security name
 
                 let dateObj = new Date();
                 const dStr = vals[idxs.date];
                 const tStr = idxs.time !== -1 ? vals[idxs.time] : '00:00:00';
 
                 try {
-                    if (config.dateFmt === 'iso' && tStr.includes('T')) {
+                    // Smart Date Parsing
+                    if (tStr && tStr.includes('T')) {
+                        // ISO Format in Time column (Zerodha style)
                         dateObj = new Date(tStr);
-                    } else if (dStr) {
-                        const cleanDate = dStr.replace(/-/g, '/');
-                        const parts = cleanDate.split('/');
-                        let y, m, d;
-                        if (config.dateFmt.includes('dd') && config.dateFmt.indexOf('dd') < config.dateFmt.indexOf('mm')) { [d, m, y] = parts; } 
-                        else { [y, m, d] = parts; }
-                        if (y && y.length === 2) y = '20' + y;
-                        const timeString = (tStr && tStr.toLowerCase() !== 'nan') ? tStr : '00:00:00';
-                        dateObj = new Date(`${y}-${m}-${d}T${timeString}`);
-                    }
+                    } else if (config.dateFmt === 'auto' || dStr) {
+                         const cleanDate = dStr.replace(/-/g, '/');
+                         const parts = cleanDate.split('/');
+                         let y, m, d;
+                         
+                         if(parts.length === 3) {
+                             if(parts[0].length === 4) { [y, m, d] = parts; } // yyyy/mm/dd
+                             else { [d, m, y] = parts; } // dd/mm/yyyy assumed for IN
+                             
+                             if (y && y.length === 2) y = '20' + y;
+                             
+                             const timeString = (tStr && tStr.toLowerCase() !== 'nan') ? tStr : '00:00:00';
+                             dateObj = new Date(`${y}-${m}-${d}T${timeString}`);
+                         }
+                    } 
                 } catch (e) { return; }
-                if (isNaN(dateObj.getTime())) return;
+                
+                if (isNaN(dateObj.getTime())) return; // Skip invalid dates
 
                 const qty = Math.abs(parseNum(vals[idxs.qty]));
                 const price = parseNum(vals[idxs.price]);
                 const charges = idxs.charges !== -1 ? parseNum(vals[idxs.charges]) : 0;
+                
                 const typeStr = (vals[idxs.type] || '').toLowerCase();
-                const isBuy = typeStr.includes('buy') || typeStr === 'b' || typeStr === 'dr'; 
+                const isBuy = typeStr === 'b' || typeStr.includes('buy') || typeStr.includes('dr');
                 
                 transactions.push({
-                    sec,
+                    sec: sec.trim(), // Ensure whitespace is gone
                     time: dateObj,
                     qty,
                     price,
@@ -168,10 +255,9 @@
                 });
             });
 
-            // 2. SORT CHRONOLOGICALLY
+            // 5. SORT & ROUND TRIP
             transactions.sort((a, b) => a.time - b.time);
 
-            // 3. ROUND TRIP PROCESSING
             const completedTrades = [];
             const openPositions = {}; 
 
@@ -214,6 +300,7 @@
                 pos.netCashflow -= txn.charges; 
                 pos.exitTime = txn.time;
                 
+                // Floating point tolerance check
                 if (Math.abs(pos.qty) < 0.0001) {
                     const tradeQty = Math.max(pos.totalBuyQty, pos.totalSellQty);
                     const avgBuyPrice = pos.totalBuyQty > 0 ? pos.totalBuyVal / pos.totalBuyQty : 0;
@@ -240,7 +327,7 @@
                 }
             });
 
-            if (completedTrades.length === 0) throw new Error("No completed trades found. (Did you close your positions?)");
+            if (completedTrades.length === 0) throw new Error("No completed trades found. Ensure you have closed positions in the uploaded timeframe.");
 
             return processTrades(completedTrades, idxs.charges !== -1);
         };
@@ -288,8 +375,6 @@
             const entryHourStats = Array(24).fill(null).map(() => ({ pnl: 0, count: 0 }));
             const exitHourStats = Array(24).fill(null).map(() => ({ pnl: 0, count: 0 }));
             const instrumentStats = {};
-            
-            // NOTE: DirectionStats should now be calculated on FILTERED TRADES to react to Discipline Simulator
             const directionStats = { Long: { pnl: 0, trades: 0, wins: 0 }, Short: { pnl: 0, trades: 0, wins: 0 } };
 
             filteredTrades.sort((a,b) => a.exitTime - b.exitTime);
@@ -419,7 +504,7 @@
             if (revengeTradeCount > 2) { const failRate = Math.round((revengeLossCount / revengeTradeCount) * 100); review.behavioral.push(`Revenge Trading Loop: You frequently re-enter the market within 15 minutes of a loss (${revengeTradeCount} times). ${failRate}% of these impulsive trades resulted in further losses. You are trading your P&L, not the chart setup.`); }
             if (avgTradesPerDay > 10) review.behavioral.push("Over-trading Alert: You are averaging over 10 trades per session. Unless you are an algo, this leads to decision fatigue and high brokerage costs. Try to limit yourself to the 3 best setups per day.");
             let worstDayIdx = -1, worstDayPnL = Infinity; dayStats.forEach((d, i) => { if (i>0 && i<6 && d.count>3 && d.pnl < worstDayPnL) { worstDayPnL = d.pnl; worstDayIdx = i; } });
-            if (worstDayPnL < 0) review.behavioral.push(`Calendar Weakness: You have a statistically significant leak on ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][worstDayIdx]}s. This could be due to weekly expiry volatility or end-of-week fatigue. Consider reducing size on this day.`);
+            if (worstDayPnL < 0) review.behavioral.push(`Calendar Weakness: You have a statistically significant leak on ${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][worstDayIdx]}s. This could be due to weekly expiry volatility or end-of-week fatigue. Consider reducing size on this day.`);
             const morningPnL = (entryHourStats[9]?.pnl || 0) + (entryHourStats[10]?.pnl || 0);
             if (morningPnL < -Math.abs(finalEquity * 0.1)) review.behavioral.push("Morning Chaos: You are losing money in the opening hour (9-11 AM). This is the most volatile time. Consider waiting until 10:30 AM for price action to settle.");
             if (profitFactor < 1.0) review.actionable.push("Capital Preservation Mode: Stop increasing your position size. Do not add funds until your Profit Factor crosses 1.2 for at least 30 consecutive trades.");
@@ -430,26 +515,49 @@
         };
 
         // --- COMPONENTS ---
-        const DisciplineSlider = ({ value, onChange, originalPnL, newPnL, excludedDays }) => {
-            const diff = newPnL - originalPnL;
-            const pnlColor = newPnL >= 0 ? "text-emerald-600" : "text-rose-600";
+        const ColumnMappingModal = ({ isOpen, headers, onClose, onConfirm }) => {
+            if (!isOpen) return null;
+            const [mappings, setMappings] = useState({ security: '', date: '', time: '', type: '', qty: '', price: '', charges: '' });
+            useEffect(() => {
+                if (isOpen && headers.length > 0) {
+                    const newMap = { ...mappings };
+                    const lowerHeaders = headers.map(h => h.toLowerCase());
+                    const findHeader = (keywords) => headers.find((h, i) => keywords.some(k => lowerHeaders[i].includes(k)));
+                    newMap.security = findHeader(['symbol', 'security', 'script', 'instrument']) || '';
+                    newMap.date = findHeader(['date', 'trade date']) || '';
+                    newMap.time = findHeader(['time', 'order time']) || '';
+                    newMap.type = findHeader(['type', 'buy/sell', 'trans']) || '';
+                    newMap.qty = findHeader(['qty', 'quantity', 'lot']) || '';
+                    newMap.price = findHeader(['price', 'rate', 'value']) || '';
+                    newMap.charges = findHeader(['charge', 'brokerage', 'fee']) || '';
+                    setMappings(newMap);
+                }
+            }, [isOpen, headers]);
+            const handleChange = (field, value) => setMappings(prev => ({ ...prev, [field]: value }));
+            const handleSubmit = () => {
+                if (!mappings.security || !mappings.qty || !mappings.price) { alert("Security, Quantity, and Price columns are required!"); return; }
+                onConfirm(mappings);
+            };
             return (
-                <div className="card p-6 mb-8 border-l-4 border-l-purple-500 bg-gradient-to-r from-white to-purple-50/30 print-break">
-                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
-                        <div><h3 className="font-bold text-slate-900 flex items-center gap-2"><Icon name="sliders" size={20} className="text-purple-600"/> Discipline Simulator</h3><p className="text-sm text-slate-500 mt-1">What if you skipped your worst days?</p></div>
-                        <div className="text-right"><span className="text-xs font-bold text-slate-400 uppercase">Potential P&L</span><div className={`text-2xl font-bold ${pnlColor}`}>₹{newPnL.toLocaleString('en-IN', {maximumFractionDigits:0})}</div>{diff > 0 && <span className="text-xs font-semibold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full">+{diff.toLocaleString()} improvement</span>}</div>
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                    <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 animate-fade-in">
+                        <div className="flex justify-between items-center mb-6"><h3 className="text-xl font-bold text-slate-900">Map Your Columns</h3><button onClick={onClose} className="text-slate-400 hover:text-slate-600"><Icon name="x" /></button></div>
+                        <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-2">{Object.keys(mappings).map(key => (
+                            <div key={key}>
+                                <div className="flex items-center gap-1 mb-1">
+                                    <label className="block text-xs font-bold text-slate-500 uppercase">{key} Column</label>
+                                    <div className="has-tooltip relative">
+                                        <Icon name="info" size={12} className="text-slate-400 cursor-help" />
+                                        <div className="tooltip absolute left-full ml-2 top-0 w-48 p-2 bg-slate-800 text-white text-xs rounded shadow-lg z-50">
+                                            {MAPPING_HELP[key]}
+                                        </div>
+                                    </div>
+                                </div>
+                                <select value={mappings[key]} onChange={(e) => handleChange(key, e.target.value)} className="w-full p-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"><option value="">-- Select Column --</option>{headers.map(h => <option key={h} value={h}>{h}</option>)}</select>
+                            </div>
+                        ))}</div>
+                        <div className="mt-6 flex gap-3"><button onClick={onClose} className="flex-1 py-2 text-slate-600 font-medium hover:bg-slate-50 rounded-lg transition">Cancel</button><button onClick={handleSubmit} className="flex-1 py-2 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition shadow-lg shadow-blue-200">Analyze</button></div>
                     </div>
-                    <div className="relative pt-6 pb-2 px-2">
-                        <input type="range" min="0" max="5" step="1" value={value} onChange={(e) => onChange(parseInt(e.target.value))} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600" />
-                        <div className="flex justify-between text-xs text-slate-400 font-bold mt-2 uppercase tracking-wide"><span>Reality</span><span>Skip 1 Bad Day</span><span>Skip 3 Bad Days</span><span>Skip 5 Bad Days</span></div>
-                        <div className="absolute -top-1 left-0 right-0 flex justify-center pointer-events-none"><span className="bg-slate-900 text-white text-xs font-bold px-3 py-1 rounded-full shadow-lg transform -translate-y-full">Excluding {value} Worst {value === 1 ? 'Day' : 'Days'}</span></div>
-                    </div>
-                    {excludedDays && excludedDays.length > 0 && (
-                        <div className="mt-6 bg-rose-50 rounded-xl border border-rose-100 overflow-hidden shadow-sm">
-                            <div className="px-4 py-3 border-b border-rose-100 flex justify-between items-center bg-rose-50/50"><h4 className="text-sm font-bold text-rose-800 flex items-center gap-2"><Icon name="calendar-x" size={16}/> Excluded "Bad Days"</h4><span className="text-xs text-rose-600 font-medium">Reflect on these sessions</span></div>
-                            <table className="w-full text-xs text-left"><thead className="text-rose-500 font-semibold border-b border-rose-100 bg-rose-50"><tr><th className="px-4 py-2">Date</th><th className="px-4 py-2 text-right">Trades</th><th className="px-4 py-2">Mistake</th><th className="px-4 py-2 text-right">Loss</th></tr></thead><tbody className="divide-y divide-rose-100 bg-white">{excludedDays.map((d, i) => <tr key={i} className="hover:bg-rose-50 transition"><td className="px-4 py-2 text-rose-900 font-medium">{d.dateStr}</td><td className="px-4 py-2 text-right text-rose-800">{d.tradeCount}</td><td className="px-4 py-2"><span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase ${d.mistake === 'Overtrading' ? 'bg-orange-100 text-orange-700' : d.mistake === 'Gave Back Profits' ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{d.mistake}</span></td><td className="px-4 py-2 text-right font-bold text-rose-600">{d.pnl.toLocaleString('en-IN', {maximumFractionDigits:0})}</td></tr>)}</tbody></table>
-                        </div>
-                    )}
                 </div>
             );
         };
@@ -478,6 +586,30 @@
                 </div>
             </div>
         );
+
+        const DisciplineSlider = ({ value, onChange, originalPnL, newPnL, excludedDays }) => {
+            const diff = newPnL - originalPnL;
+            const pnlColor = newPnL >= 0 ? "text-emerald-600" : "text-rose-600";
+            return (
+                <div className="card p-6 mb-8 border-l-4 border-l-purple-500 bg-gradient-to-r from-white to-purple-50/30 print-break">
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
+                        <div><h3 className="font-bold text-slate-900 flex items-center gap-2"><Icon name="sliders" size={20} className="text-purple-600"/> Discipline Simulator</h3><p className="text-sm text-slate-500 mt-1">What if you skipped your worst days?</p></div>
+                        <div className="text-right"><span className="text-xs font-bold text-slate-400 uppercase">Potential P&L</span><div className={`text-2xl font-bold ${pnlColor}`}>₹{newPnL.toLocaleString('en-IN', {maximumFractionDigits:0})}</div>{diff > 0 && <span className="text-xs font-semibold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full">+{diff.toLocaleString()} improvement</span>}</div>
+                    </div>
+                    <div className="relative pt-6 pb-2 px-2">
+                        <input type="range" min="0" max="5" step="1" value={value} onChange={(e) => onChange(parseInt(e.target.value))} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600" />
+                        <div className="flex justify-between text-xs text-slate-400 font-bold mt-2 uppercase tracking-wide"><span>Reality</span><span>Skip 1 Bad Day</span><span>Skip 3 Bad Days</span><span>Skip 5 Bad Days</span></div>
+                        <div className="absolute -top-1 left-0 right-0 flex justify-center pointer-events-none"><span className="bg-slate-900 text-white text-xs font-bold px-3 py-1 rounded-full shadow-lg transform -translate-y-full">Excluding {value} Worst {value === 1 ? 'Day' : 'Days'}</span></div>
+                    </div>
+                    {excludedDays && excludedDays.length > 0 && (
+                        <div className="mt-6 bg-rose-50 rounded-xl border border-rose-100 overflow-hidden shadow-sm">
+                            <div className="px-4 py-3 border-b border-rose-100 flex justify-between items-center bg-rose-50/50"><h4 className="text-sm font-bold text-rose-800 flex items-center gap-2"><Icon name="calendar-x" size={16}/> Excluded "Bad Days"</h4><span className="text-xs text-rose-600 font-medium">Reflect on these sessions</span></div>
+                            <table className="w-full text-xs text-left"><thead className="text-rose-500 font-semibold border-b border-rose-100 bg-rose-50"><tr><th className="px-4 py-2">Date</th><th className="px-4 py-2 text-right">Trades</th><th className="px-4 py-2">Mistake</th><th className="px-4 py-2 text-right">Loss</th></tr></thead><tbody className="divide-y divide-rose-100 bg-white">{excludedDays.map((d, i) => <tr key={i} className="hover:bg-rose-50 transition"><td className="px-4 py-2 text-rose-900 font-medium">{d.dateStr}</td><td className="px-4 py-2 text-right text-rose-800">{d.tradeCount}</td><td className="px-4 py-2"><span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase ${d.mistake === 'Overtrading' ? 'bg-orange-100 text-orange-700' : d.mistake === 'Gave Back Profits' ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{d.mistake}</span></td><td className="px-4 py-2 text-right font-bold text-rose-600">{d.pnl.toLocaleString('en-IN', {maximumFractionDigits:0})}</td></tr>)}</tbody></table>
+                        </div>
+                    )}
+                </div>
+            );
+        };
 
         const DirectionSimulator = ({ filter, setFilter, simulatedPnL, diff }) => {
             const pnlColor = simulatedPnL >= 0 ? "text-emerald-600" : "text-rose-600";
@@ -558,44 +690,7 @@
                 const gradient = ctx.createLinearGradient(0, 0, 0, 300);
                 gradient.addColorStop(0, 'rgba(37, 99, 235, 0.15)');
                 gradient.addColorStop(1, 'rgba(37, 99, 235, 0)');
-                
-                const datasets = [];
-                const isFiltered = originalCurve && (curve.length !== originalCurve.length || curve[curve.length-1].y !== originalCurve[originalCurve.length-1].y);
-
-                if (isFiltered) {
-                    datasets.push({
-                        label: 'Reality',
-                        data: originalCurve.map(d => d.y),
-                        borderColor: '#94a3b8', 
-                        backgroundColor: 'transparent',
-                        borderDash: [5, 5],
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        tension: 0.3
-                    });
-                }
-
-                datasets.push({ 
-                    label: isFiltered ? 'Simulated' : 'Equity', 
-                    data: curve.map(d => d.y), 
-                    borderColor: '#2563eb', 
-                    backgroundColor: gradient, 
-                    fill: !isFiltered, 
-                    tension: 0.3, 
-                    pointRadius: 0, 
-                    borderWidth: 2 
-                });
-
-                const chart = new Chart(ctx, { 
-                    type: 'line', 
-                    data: { labels: curve.map(d => d.x), datasets }, 
-                    options: { 
-                        responsive: true, maintainAspectRatio: false, 
-                        plugins: { legend: { display: isFiltered }, tooltip: { mode: 'index', intersect: false } }, 
-                        scales: { x: { display: false }, y: { border: { display: false }, grid: { color: '#f1f5f9' } } }, 
-                        interaction: { mode: 'nearest', axis: 'x', intersect: false } 
-                    } 
-                });
+                const chart = new Chart(ctx, { type: 'line', data: { labels: curve.map(d => d.x), datasets: [{ label: 'Equity', data: curve.map(d => d.y), borderColor: '#2563eb', backgroundColor: gradient, fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { border: { display: false }, grid: { color: '#f1f5f9' } } }, interaction: { mode: 'nearest', axis: 'x', intersect: false } } });
                 return () => chart.destroy();
             }, [curve, originalCurve]);
             return <canvas ref={ref} />;
@@ -622,15 +717,34 @@
             const [error, setError] = useState(null);
             const [disciplineLevel, setDisciplineLevel] = useState(0); 
             const [directionFilter, setDirectionFilter] = useState('all'); 
+            const [showMappingModal, setShowMappingModal] = useState(false);
+            const [rawFileContent, setRawFileContent] = useState(null);
+            const [detectedHeaders, setDetectedHeaders] = useState([]);
             const fileRef = useRef(null);
             const uploadSectionRef = useRef(null); 
             
             const [rawTrades, setRawTrades] = useState(null);
             const [hasCharges, setHasCharges] = useState(true);
 
+            
+
+
             useEffect(() => {
-                if (selectedBroker && uploadSectionRef.current) uploadSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                if (!selectedBroker || !uploadSectionRef.current) return;
+
+                const yOffset = -580; // adjust this
+                const y =
+                    uploadSectionRef.current.getBoundingClientRect().top +
+                    window.pageYOffset +
+                    yOffset;
+
+                window.scrollTo({
+                    top: y,
+                    behavior: 'smooth',
+                });
             }, [selectedBroker]);
+
+
 
             useEffect(() => {
                 if (rawTrades) {
@@ -640,22 +754,43 @@
                 }
             }, [disciplineLevel, directionFilter]); 
 
+            const processFile = (text, mappings = null) => {
+                try {
+                    const result = parseTradeData(text, selectedBroker, mappings);
+                    setRawTrades(result.trades); 
+                    setHasCharges(result.hasCharges);
+                    setData(result);
+                    setError(null);
+                    setDisciplineLevel(0); 
+                    setDirectionFilter('all');
+                } catch (err) {
+                    if (selectedBroker === 'other' && !mappings) {
+                        const headers = text.split('\n')[0].split(',').map(h => h.trim());
+                        setDetectedHeaders(headers);
+                        setRawFileContent(text);
+                        setShowMappingModal(true);
+                        setError(null); 
+                    } else {
+                        setError(err.message); 
+                        setData(null); 
+                    }
+                }
+            };
+
             const handleFile = (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
                 const reader = new FileReader();
                 reader.onload = (ev) => {
-                    try {
-                        const result = parseTradeData(ev.target.result, selectedBroker);
-                        setRawTrades(result.trades); 
-                        setHasCharges(result.hasCharges);
-                        setData(result);
-                        setError(null);
-                        setDisciplineLevel(0); 
-                        setDirectionFilter('all');
-                    } catch (err) { setError(err.message); setData(null); }
+                    const text = ev.target.result;
+                    processFile(text);
                 };
                 reader.readAsText(file);
+            };
+
+            const handleMappingConfirm = (mappings) => {
+                setShowMappingModal(false);
+                processFile(rawFileContent, mappings);
             };
 
             const loadDemoData = () => {
@@ -699,7 +834,12 @@
                         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
                             <div className="flex items-center gap-3 cursor-pointer" onClick={handleReload}>
                                 <div className="bg-slate-900 text-white p-2.5 rounded-xl shadow-lg shadow-slate-200"><Icon name="bar-chart-big" size={24} /></div>
-                                <div><h1 className="font-extrabold text-xl text-slate-900 leading-none tracking-tight">Trade Audit Pro</h1><span className="text-[11px] font-bold text-blue-600 tracking-wide uppercase">by Trading With Sujay</span></div>
+                                <div>
+                                    <h1 className="font-extrabold text-xl text-slate-900 leading-none tracking-tight">Trade Audit Pro</h1>
+                                    <div className="flex items-center gap-2 mt-0.5">
+                                        <span className="text-[10px] font-bold text-blue-600 tracking-wide uppercase">by Trading With Sujay</span>
+                                    </div>
+                                </div>
                             </div>
                             {data && (
                                 <div className="flex gap-2">
@@ -714,27 +854,42 @@
                             <div className="max-w-4xl mx-auto mt-16 px-6 animate-fade-in">
                                 <div className="text-center mb-12">
                                     <div className="inline-flex items-center gap-2 bg-emerald-50 text-emerald-700 px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wide mb-6 border border-emerald-100 shadow-sm"><Icon name="shield-check" size={14} /> 100% Client-Side Privacy</div>
-                                    <h1 className="text-4xl md:text-5xl font-extrabold text-slate-900 mb-6 tracking-tight">Professional Audit <br/> <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600">For Your Trading Journey</span></h1>
+                                    <h1 className="text-4xl md:text-5xl font-extrabold text-slate-900 mb-6 tracking-tight">AI-Powered Professional Audit <br/> <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600">For Your Trading Journey</span></h1>
                                     <p className="text-lg text-slate-500 max-w-2xl mx-auto">Upload your broker's CSV to get instant, actionable insights. Secure and private. Financial data never leaves your browser.</p>
                                     <div className="mt-8 flex justify-center gap-4"><button onClick={loadDemoData} className="bg-white hover:bg-slate-50 text-slate-700 font-bold py-3 px-6 rounded-xl border border-slate-200 shadow-sm transition flex items-center gap-2"><Icon name="play-circle" size={18} /> Try Demo Data</button></div>
                                 </div>
-                                <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-8 max-w-3xl mx-auto">
+                                
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-12 max-w-3xl mx-auto">
                                     {Object.entries(BROKERS).map(([key, conf]) => (
-                                        <div key={key} onClick={() => setSelectedBroker(key)} className={`cursor-pointer p-4 rounded-xl border flex flex-col items-center gap-3 bg-white transition-all ${selectedBroker === key ? 'border-blue-500 ring-2 ring-blue-100 shadow-md transform -translate-y-1' : 'border-slate-200 hover:border-blue-300 hover:shadow-sm'}`}>
-                                            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${conf.bg} ${conf.color}`}><Icon name={key === 'kotak' ? 'infinity' : key === 'zerodha' ? 'zap' : 'bar-chart-2'} size={20} /></div>
+                                        <div key={key} onClick={() => setSelectedBroker(key)} className={`cursor-pointer p-4 rounded-xl border flex flex-col items-center justify-center gap-3 bg-white transition-all min-h-[120px] ${selectedBroker === key ? 'border-blue-500 ring-2 ring-blue-100 shadow-md transform -translate-y-1' : 'border-slate-200 hover:border-blue-300 hover:shadow-sm'}`}>
+                                            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${conf.bg} ${conf.color}`}><Icon name={key === 'kotak' ? 'infinity' : key === 'zerodha' ? 'zap' : key === 'dhan' ? 'bar-chart-2' : 'settings'} size={20} /></div>
                                             <span className="font-bold text-sm text-slate-700">{conf.name}</span>
                                         </div>
                                     ))}
                                 </div>
+
                                 {selectedBroker && (
-                                    <div ref={uploadSectionRef} className="bg-white p-8 rounded-2xl border border-blue-100 shadow-xl shadow-blue-50/50 text-center max-w-lg mx-auto">
+                                    <div ref={uploadSectionRef} className="bg-white p-8 rounded-2xl border border-blue-100 shadow-xl shadow-blue-50/50 text-center max-w-lg mx-auto mb-16">
                                         <div className="w-12 h-12 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center mx-auto mb-4"><Icon name="upload-cloud" size={24} /></div>
-                                        <h3 className="text-lg font-bold text-slate-900 mb-2">Upload CSV</h3>
+                                        <h3 className="text-lg font-bold text-slate-900 mb-2">Upload {BROKERS[selectedBroker].name} CSV</h3>
                                         <button onClick={() => fileRef.current.click()} className="bg-slate-900 hover:bg-slate-800 text-white px-8 py-3 rounded-lg font-bold shadow-lg shadow-slate-200 transition active:scale-95">Select File</button>
                                         <input type="file" ref={fileRef} onChange={handleFile} accept=".csv" className="hidden" />
                                     </div>
                                 )}
-                                {error && <div className="mt-6 text-center text-rose-600 font-medium bg-rose-50 p-3 rounded-lg border border-rose-100 inline-block w-full">{error}</div>}
+                                {error && <div className="mt-6 text-center text-rose-600 font-medium bg-rose-50 p-3 rounded-lg border border-rose-100 inline-block w-full mb-12">{error}</div>}
+                                
+                                <div className="max-w-2xl mx-auto border-t border-slate-200 pt-10">
+                                    <h3 className="text-center font-bold text-slate-900 mb-6 text-xl">Frequently Asked Questions</h3>
+                                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-2">
+                                        <FAQItem question="Is my data safe?" answer="Absolutely. This tool runs entirely in your browser. Your trading CSV file is processed locally on your device and is never uploaded to any server. You can even disconnect your internet after loading the page and it will still work." />
+                                        <FAQItem question="Which brokers are supported?" answer="We officially support Kotak, Zerodha, and Dhan. For any other broker (Angel, Groww, Upstox, etc.), select the 'Other Broker' option and manually map your columns in seconds." />
+                                        <FAQItem question="How do I download my Tradebook?" answer="Log in to your broker's backoffice console (e.g., Zerodha Console, Kotak Neo Backoffice). Look for 'Reports' > 'Tradebook' or 'Global P&L'. Download the report as a CSV file for the desired date range." />
+                                        <FAQItem question="Why does my Win Rate look different?" answer="Brokers often calculate metrics differently. Trade Audit Pro groups scalped trades of the same instrument into a single 'Round Trip' trade to give you a true picture of your strategy's effectiveness, rather than just raw order execution stats." />
+                                        <FAQItem question="What is 'Discipline Simulator'?" answer="It's a powerful 'What If' analysis tool. It allows you to see what your P&L would look like if you had avoided your worst trading days (e.g., revenge trading days). It highlights how much profit you leave on the table due to lack of discipline." />
+                                        <FAQItem question="Does it support Options Trading?" answer="Yes! The tool automatically detects Options trades (CE/PE) and intelligently groups them. Buying a PE is correctly analyzed as a 'Short' (Bearish) trade, while Selling a PE is a 'Long' (Bullish) trade." />
+                                        <FAQItem question="How is 'Net P&L' calculated?" answer="Net P&L is your Gross Profit minus all brokerage, taxes, and transaction charges found in your CSV. If your broker CSV doesn't include charges (like Zerodha), the tool will show Gross P&L and mark it clearly." />
+                                    </div>
+                                </div>
                             </div>
                         ) : (
                             <main className="max-w-7xl mx-auto px-6 mt-10 space-y-8 animate-slide-up">
@@ -783,6 +938,7 @@
                                 <TradeLogTable trades={data.trades} />
                             </main>
                         )}
+                        <ColumnMappingModal isOpen={showMappingModal} headers={detectedHeaders} onClose={() => setShowMappingModal(false)} onConfirm={handleMappingConfirm} />
                     </div>
 
                     <footer className="mt-20 py-12 bg-white border-t border-slate-200 no-print">
